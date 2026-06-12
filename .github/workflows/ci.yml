@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Build (Release x64)
+        run: msbuild MinimalAppKiller.sln /t:Build /p:Configuration=Release /p:Platform=x64 /p:PlatformToolset=v143
+
+      - name: Build installer
+        run: |
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" installer\MinimalAppKiller.iss /DAppVersion=0.0.0
+
+      - name: Upload executable artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MinimalAppKiller-windows
+          path: x64/Release/MinimalAppKiller.exe
+          retention-days: 14
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MinimalAppKiller-installer
+          path: dist/*.exe
+          retention-days: 14

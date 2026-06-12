@@ -1,51 +1,99 @@
+// MinimalAppKiller - lightweight tray-based GUI app that automatically
+// terminates user-selected processes.
+
 #define NOMINMAX
-#include <Windows.h>
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <windowsx.h>
+#include <commctrl.h>
+#include <shellapi.h>
+#include <shlobj.h>
 #include <tlhelp32.h>
+#include <uxtheme.h>
 
 #include <algorithm>
 #include <atomic>
-#include <chrono>
 #include <cwctype>
-#include <filesystem>
 #include <fstream>
-#include <iostream>
-#include <optional>
+#include <mutex>
 #include <string>
-#include <string_view>
 #include <thread>
 #include <unordered_set>
 #include <vector>
 
+#include "resource.h"
+#include "version.h"
+
+#ifdef _MSC_VER
+#pragma comment(lib, "comctl32.lib")
+#pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "uxtheme.lib")
+#pragma comment(lib, "advapi32.lib")
+#endif
+
 namespace
 {
-    std::atomic<bool> g_running{true};
+    constexpr wchar_t kWindowClass[] = L"MinimalAppKillerWnd";
+    constexpr wchar_t kWindowTitle[] = L"Minimal App Killer";
+    constexpr wchar_t kMutexName[] = L"Local\\MinimalAppKillerSingleInstance";
+    constexpr wchar_t kRunKeyPath[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+    constexpr wchar_t kRunValueName[] = L"MinimalAppKiller";
+    constexpr UINT WM_TRAYICON = WM_APP + 1;
+    constexpr UINT kTrayIconId = 1;
+    constexpr unsigned int kScanIntervalMs = 1000;
 
-    struct Config
+    struct AppEntry
     {
-        std::vector<std::wstring> processNames;
-        unsigned int intervalMs = 500;
-        unsigned int noHitLogEveryLoops = 60;
+        std::wstring name;
+        bool enabled = true;
     };
+
+    struct AppState
+    {
+        std::vector<AppEntry> apps;
+        bool active = true;
+    };
+
+    // UI / shared state
+    HINSTANCE g_instance = nullptr;
+    HWND g_mainWindow = nullptr;
+    HWND g_listView = nullptr;
+    HWND g_editApp = nullptr;
+    HWND g_statusLabel = nullptr;
+    HWND g_stateLabel = nullptr;
+    HWND g_toggleButton = nullptr;
+    HWND g_startupCheck = nullptr;
+    HFONT g_uiFont = nullptr;
+    HFONT g_titleFont = nullptr;
+    HBRUSH g_backgroundBrush = nullptr;
+    NOTIFYICONDATAW g_trayIcon{};
+    bool g_trayBalloonShown = false;
+    bool g_suppressListNotifications = false;
+
+    AppState g_state;
+    std::mutex g_stateMutex;
+    std::atomic<bool> g_workerRunning{true};
+    std::atomic<unsigned long long> g_killCount{0};
+    std::thread g_workerThread;
+
+    // Processes that must never be added as kill targets.
+    const std::unordered_set<std::wstring> kProtectedProcesses = {
+        L"minimalappkiller.exe", L"csrss.exe", L"wininit.exe", L"winlogon.exe",
+        L"services.exe", L"lsass.exe", L"smss.exe", L"svchost.exe",
+        L"system", L"system idle process", L"dwm.exe"};
 
     std::wstring Trim(const std::wstring &value)
     {
-        const auto isSpace = [](wchar_t ch)
-        {
-            return ::iswspace(ch) != 0;
-        };
-
         size_t start = 0;
-        while (start < value.size() && isSpace(value[start]))
+        while (start < value.size() && ::iswspace(value[start]))
         {
             ++start;
         }
-
         size_t end = value.size();
-        while (end > start && isSpace(value[end - 1]))
+        while (end > start && ::iswspace(value[end - 1]))
         {
             --end;
         }
-
         return value.substr(start, end - start);
     }
 
@@ -56,103 +104,172 @@ namespace
         return value;
     }
 
-    void PrintUsage(const wchar_t *appName)
+    std::wstring Utf8ToWide(const std::string &text)
     {
-        std::wcout << L"Usage: " << appName << L" [config-file]\n";
-        std::wcout << L"Default config file: appkiller.conf\n";
+        if (text.empty())
+        {
+            return std::wstring();
+        }
+        const int needed = MultiByteToWideChar(CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()), nullptr, 0);
+        std::wstring result(static_cast<size_t>(needed), L'\0');
+        MultiByteToWideChar(CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()), result.data(), needed);
+        return result;
     }
 
-    bool ParseUnsigned(const std::wstring &text, unsigned int &outValue)
+    std::string WideToUtf8(const std::wstring &text)
     {
-        try
+        if (text.empty())
         {
-            size_t consumed = 0;
-            const unsigned long parsed = std::stoul(text, &consumed, 10);
-            if (consumed != text.size() || parsed > UINT_MAX)
+            return std::string();
+        }
+        const int needed = WideCharToMultiByte(CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()), nullptr, 0, nullptr, nullptr);
+        std::string result(static_cast<size_t>(needed), '\0');
+        WideCharToMultiByte(CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()), result.data(), needed, nullptr, nullptr);
+        return result;
+    }
+
+    // ---------------- Settings persistence ----------------
+
+    std::wstring SettingsDirectory()
+    {
+        wchar_t appData[MAX_PATH]{};
+        if (FAILED(SHGetFolderPathW(nullptr, CSIDL_APPDATA, nullptr, SHGFP_TYPE_CURRENT, appData)))
+        {
+            return std::wstring();
+        }
+        std::wstring dir = std::wstring(appData) + L"\\MinimalAppKiller";
+        CreateDirectoryW(dir.c_str(), nullptr);
+        return dir;
+    }
+
+    std::wstring SettingsPath()
+    {
+        const std::wstring dir = SettingsDirectory();
+        if (dir.empty())
+        {
+            return std::wstring();
+        }
+        return dir + L"\\settings.ini";
+    }
+
+    void LoadSettings(AppState &state)
+    {
+        const std::wstring path = SettingsPath();
+        if (path.empty())
+        {
+            return;
+        }
+
+        std::ifstream file(WideToUtf8(path).c_str());
+        if (!file)
+        {
+            return;
+        }
+
+        std::unordered_set<std::wstring> seen;
+        std::string rawLine;
+        while (std::getline(file, rawLine))
+        {
+            std::wstring line = Trim(Utf8ToWide(rawLine));
+            if (line.empty() || line[0] == L'#')
             {
-                return false;
+                continue;
             }
 
-            outValue = static_cast<unsigned int>(parsed);
-            return true;
+            if (line.rfind(L"active=", 0) == 0)
+            {
+                state.active = line.substr(7) != L"0";
+                continue;
+            }
+
+            if (line.rfind(L"app=", 0) == 0)
+            {
+                std::wstring payload = line.substr(4);
+                bool enabled = true;
+                const size_t sep = payload.rfind(L'|');
+                if (sep != std::wstring::npos)
+                {
+                    enabled = payload.substr(sep + 1) != L"0";
+                    payload = payload.substr(0, sep);
+                }
+                payload = Trim(payload);
+                if (payload.empty())
+                {
+                    continue;
+                }
+                if (seen.insert(ToLower(payload)).second)
+                {
+                    state.apps.push_back({payload, enabled});
+                }
+            }
         }
-        catch (...)
+    }
+
+    void SaveSettings(const AppState &state)
+    {
+        const std::wstring path = SettingsPath();
+        if (path.empty())
+        {
+            return;
+        }
+
+        std::ofstream file(WideToUtf8(path).c_str(), std::ios::trunc);
+        if (!file)
+        {
+            return;
+        }
+
+        file << "# MinimalAppKiller settings\n";
+        file << "active=" << (state.active ? 1 : 0) << "\n";
+        for (const AppEntry &app : state.apps)
+        {
+            file << "app=" << WideToUtf8(app.name) << "|" << (app.enabled ? 1 : 0) << "\n";
+        }
+    }
+
+    // ---------------- Run-on-startup (HKCU Run key) ----------------
+
+    bool IsStartupEnabled()
+    {
+        HKEY key = nullptr;
+        if (RegOpenKeyExW(HKEY_CURRENT_USER, kRunKeyPath, 0, KEY_QUERY_VALUE, &key) != ERROR_SUCCESS)
         {
             return false;
         }
+        const bool exists = RegQueryValueExW(key, kRunValueName, nullptr, nullptr, nullptr, nullptr) == ERROR_SUCCESS;
+        RegCloseKey(key);
+        return exists;
     }
 
-    std::optional<Config> LoadConfig(const std::filesystem::path &configPath)
+    void SetStartupEnabled(bool enable)
     {
-        std::wifstream file(configPath);
-        if (!file)
+        HKEY key = nullptr;
+        if (RegOpenKeyExW(HKEY_CURRENT_USER, kRunKeyPath, 0, KEY_SET_VALUE, &key) != ERROR_SUCCESS)
         {
-            std::wcerr << L"Failed to open config: " << configPath.wstring() << L"\n";
-            return std::nullopt;
+            return;
         }
 
-        Config config;
-        std::unordered_set<std::wstring> seen;
-
-        std::wstring line;
-        unsigned int lineNumber = 0;
-        while (std::getline(file, line))
+        if (enable)
         {
-            ++lineNumber;
-            std::wstring trimmed = Trim(line);
-            if (trimmed.empty() || trimmed.starts_with(L'#'))
-            {
-                continue;
-            }
-
-            if (trimmed.starts_with(L"interval_ms="))
-            {
-                const std::wstring value = Trim(trimmed.substr(std::wstring_view(L"interval_ms=").size()));
-                unsigned int parsed = 0;
-                if (!ParseUnsigned(value, parsed) || parsed == 0)
-                {
-                    std::wcerr << L"Invalid interval_ms at line " << lineNumber << L"\n";
-                    return std::nullopt;
-                }
-
-                config.intervalMs = parsed;
-                continue;
-            }
-
-            if (trimmed.starts_with(L"no_hit_log_every_loops="))
-            {
-                const std::wstring value = Trim(trimmed.substr(std::wstring_view(L"no_hit_log_every_loops=").size()));
-                unsigned int parsed = 0;
-                if (!ParseUnsigned(value, parsed) || parsed == 0)
-                {
-                    std::wcerr << L"Invalid no_hit_log_every_loops at line " << lineNumber << L"\n";
-                    return std::nullopt;
-                }
-
-                config.noHitLogEveryLoops = parsed;
-                continue;
-            }
-
-            const std::wstring normalized = ToLower(trimmed);
-            if (seen.insert(normalized).second)
-            {
-                config.processNames.push_back(trimmed);
-            }
+            wchar_t modulePath[MAX_PATH]{};
+            GetModuleFileNameW(nullptr, modulePath, MAX_PATH);
+            const std::wstring command = L"\"" + std::wstring(modulePath) + L"\" --minimized";
+            RegSetValueExW(key, kRunValueName, 0, REG_SZ,
+                           reinterpret_cast<const BYTE *>(command.c_str()),
+                           static_cast<DWORD>((command.size() + 1) * sizeof(wchar_t)));
         }
-
-        if (config.processNames.empty())
+        else
         {
-            std::wcerr << L"Config has no process names. Add one exe name per line (for example: notepad.exe).\n";
-            return std::nullopt;
+            RegDeleteValueW(key, kRunValueName);
         }
-
-        return config;
+        RegCloseKey(key);
     }
+
+    // ---------------- Process scanning / killing ----------------
 
     std::vector<DWORD> FindTargetPids(const std::unordered_set<std::wstring> &targets)
     {
         std::vector<DWORD> pids;
-
         HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
         if (snapshot == INVALID_HANDLE_VALUE)
         {
@@ -161,21 +278,16 @@ namespace
 
         PROCESSENTRY32W process{};
         process.dwSize = sizeof(process);
-
-        if (!Process32FirstW(snapshot, &process))
+        if (Process32FirstW(snapshot, &process))
         {
-            CloseHandle(snapshot);
-            return pids;
-        }
-
-        do
-        {
-            std::wstring exe = ToLower(process.szExeFile);
-            if (targets.find(exe) != targets.end())
+            do
             {
-                pids.push_back(process.th32ProcessID);
-            }
-        } while (Process32NextW(snapshot, &process));
+                if (targets.count(ToLower(process.szExeFile)) != 0)
+                {
+                    pids.push_back(process.th32ProcessID);
+                }
+            } while (Process32NextW(snapshot, &process));
+        }
 
         CloseHandle(snapshot);
         return pids;
@@ -188,133 +300,622 @@ namespace
         {
             return false;
         }
-
         const BOOL terminated = TerminateProcess(process, 1);
         CloseHandle(process);
         return terminated != FALSE;
     }
 
-    BOOL WINAPI ConsoleCtrlHandler(DWORD signal)
+    void WorkerLoop()
     {
-        switch (signal)
+        while (g_workerRunning)
         {
-        case CTRL_C_EVENT:
-        case CTRL_BREAK_EVENT:
-        case CTRL_CLOSE_EVENT:
-        case CTRL_SHUTDOWN_EVENT:
-            g_running = false;
-            return TRUE;
-        default:
-            return FALSE;
-        }
-    }
-} // namespace
-
-int wmain(int argc, wchar_t *argv[])
-{
-    if (!SetConsoleCtrlHandler(ConsoleCtrlHandler, TRUE))
-    {
-        std::wcerr << L"Failed to register console handler.\n";
-        return 1;
-    }
-
-    std::filesystem::path configPath = L"appkiller.conf";
-    if (argc >= 2)
-    {
-        const std::wstring arg = argv[1];
-        if (arg == L"-h" || arg == L"--help" || arg == L"/?")
-        {
-            PrintUsage(argv[0]);
-            return 0;
-        }
-
-        configPath = arg;
-    }
-
-    std::optional<Config> config = LoadConfig(configPath);
-    if (!config)
-    {
-        return 1;
-    }
-
-    std::filesystem::file_time_type lastConfigWriteTime{};
-    std::error_code fsError;
-    if (std::filesystem::exists(configPath, fsError))
-    {
-        lastConfigWriteTime = std::filesystem::last_write_time(configPath, fsError);
-    }
-
-    std::wcout << L"MinimalAppKiller started. Press Ctrl+C to stop.\n";
-    std::wcout << L"Config: " << configPath.wstring() << L"\n";
-    std::wcout << L"Targets:";
-    for (const auto &name : config->processNames)
-    {
-        std::wcout << L" " << name;
-    }
-    std::wcout << L"\n";
-
-    auto buildTargets = [](const Config &cfg)
-    {
-        std::unordered_set<std::wstring> t;
-        t.reserve(cfg.processNames.size());
-        for (const auto &name : cfg.processNames)
-        {
-            t.insert(ToLower(name));
-        }
-        return t;
-    };
-
-    std::unordered_set<std::wstring> targets = buildTargets(*config);
-    unsigned int idleLoops = 0;
-
-    while (g_running)
-    {
-        fsError.clear();
-        const auto currentWriteTime = std::filesystem::last_write_time(configPath, fsError);
-        if (!fsError && currentWriteTime != lastConfigWriteTime)
-        {
-            if (const auto reloaded = LoadConfig(configPath))
+            std::unordered_set<std::wstring> targets;
             {
-                config = reloaded;
-                targets = buildTargets(*config);
-                lastConfigWriteTime = currentWriteTime;
-                std::wcout << L"Config reloaded. " << config->processNames.size() << L" targets.\n";
+                std::lock_guard<std::mutex> lock(g_stateMutex);
+                if (g_state.active)
+                {
+                    for (const AppEntry &app : g_state.apps)
+                    {
+                        if (app.enabled)
+                        {
+                            targets.insert(ToLower(app.name));
+                        }
+                    }
+                }
+            }
+
+            if (!targets.empty())
+            {
+                unsigned int killed = 0;
+                for (const DWORD pid : FindTargetPids(targets))
+                {
+                    if (KillProcessByPid(pid))
+                    {
+                        ++killed;
+                    }
+                }
+                if (killed > 0)
+                {
+                    g_killCount += killed;
+                    if (g_mainWindow != nullptr)
+                    {
+                        PostMessageW(g_mainWindow, WM_APP + 2, 0, 0);
+                    }
+                }
+            }
+
+            for (unsigned int waited = 0; waited < kScanIntervalMs && g_workerRunning; waited += 100)
+            {
+                Sleep(100);
+            }
+        }
+    }
+
+    // ---------------- Tray icon ----------------
+
+    void AddTrayIcon(HWND hwnd)
+    {
+        g_trayIcon = {};
+        g_trayIcon.cbSize = sizeof(g_trayIcon);
+        g_trayIcon.hWnd = hwnd;
+        g_trayIcon.uID = kTrayIconId;
+        g_trayIcon.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+        g_trayIcon.uCallbackMessage = WM_TRAYICON;
+        g_trayIcon.hIcon = static_cast<HICON>(LoadImageW(g_instance, MAKEINTRESOURCEW(IDI_APPICON), IMAGE_ICON,
+                                                         GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), 0));
+        lstrcpynW(g_trayIcon.szTip, kWindowTitle, ARRAYSIZE(g_trayIcon.szTip));
+        Shell_NotifyIconW(NIM_ADD, &g_trayIcon);
+    }
+
+    void RemoveTrayIcon()
+    {
+        Shell_NotifyIconW(NIM_DELETE, &g_trayIcon);
+        if (g_trayIcon.hIcon != nullptr)
+        {
+            DestroyIcon(g_trayIcon.hIcon);
+            g_trayIcon.hIcon = nullptr;
+        }
+    }
+
+    void ShowTrayBalloonOnce()
+    {
+        if (g_trayBalloonShown)
+        {
+            return;
+        }
+        g_trayBalloonShown = true;
+        g_trayIcon.uFlags = NIF_INFO;
+        g_trayIcon.dwInfoFlags = NIIF_INFO;
+        lstrcpynW(g_trayIcon.szInfoTitle, kWindowTitle, ARRAYSIZE(g_trayIcon.szInfoTitle));
+        lstrcpynW(g_trayIcon.szInfo, L"Still running in the background. Double-click the tray icon to open.",
+                  ARRAYSIZE(g_trayIcon.szInfo));
+        Shell_NotifyIconW(NIM_MODIFY, &g_trayIcon);
+        g_trayIcon.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+    }
+
+    void ShowTrayMenu(HWND hwnd)
+    {
+        bool active = false;
+        {
+            std::lock_guard<std::mutex> lock(g_stateMutex);
+            active = g_state.active;
+        }
+
+        HMENU menu = CreatePopupMenu();
+        AppendMenuW(menu, MF_STRING, IDM_TRAY_OPEN, L"&Open Minimal App Killer");
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(menu, MF_STRING | (active ? MF_CHECKED : 0), IDM_TRAY_TOGGLE, L"&Active");
+        AppendMenuW(menu, MF_STRING | (IsStartupEnabled() ? MF_CHECKED : 0), IDM_TRAY_STARTUP, L"Run on &startup");
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(menu, MF_STRING, IDM_TRAY_EXIT, L"E&xit");
+        SetMenuDefaultItem(menu, IDM_TRAY_OPEN, FALSE);
+
+        POINT cursor{};
+        GetCursorPos(&cursor);
+        SetForegroundWindow(hwnd);
+        TrackPopupMenu(menu, TPM_RIGHTBUTTON, cursor.x, cursor.y, 0, hwnd, nullptr);
+        DestroyMenu(menu);
+    }
+
+    // ---------------- UI helpers ----------------
+
+    void UpdateStatus()
+    {
+        size_t total = 0;
+        size_t enabled = 0;
+        bool active = false;
+        {
+            std::lock_guard<std::mutex> lock(g_stateMutex);
+            total = g_state.apps.size();
+            active = g_state.active;
+            for (const AppEntry &app : g_state.apps)
+            {
+                if (app.enabled)
+                {
+                    ++enabled;
+                }
+            }
+        }
+
+        wchar_t status[160];
+        wsprintfW(status, L"Watching %u of %u app(s)  \u2022  %u process(es) terminated",
+                  static_cast<unsigned>(enabled), static_cast<unsigned>(total),
+                  static_cast<unsigned>(g_killCount.load()));
+        SetWindowTextW(g_statusLabel, status);
+
+        SetWindowTextW(g_stateLabel, active ? L"\u25CF Active" : L"\u23F8 Paused");
+        SetWindowTextW(g_toggleButton, active ? L"Pause" : L"Resume");
+        InvalidateRect(g_stateLabel, nullptr, TRUE);
+    }
+
+    void RefreshListView()
+    {
+        g_suppressListNotifications = true;
+        ListView_DeleteAllItems(g_listView);
+
+        std::lock_guard<std::mutex> lock(g_stateMutex);
+        int index = 0;
+        for (const AppEntry &app : g_state.apps)
+        {
+            LVITEMW item{};
+            item.mask = LVIF_TEXT;
+            item.iItem = index;
+            item.pszText = const_cast<wchar_t *>(app.name.c_str());
+            ListView_InsertItem(g_listView, &item);
+            ListView_SetCheckState(g_listView, index, app.enabled ? TRUE : FALSE);
+            ++index;
+        }
+        g_suppressListNotifications = false;
+    }
+
+    void PersistState()
+    {
+        std::lock_guard<std::mutex> lock(g_stateMutex);
+        SaveSettings(g_state);
+    }
+
+    void AddAppFromEdit(HWND hwnd)
+    {
+        wchar_t buffer[260]{};
+        GetWindowTextW(g_editApp, buffer, ARRAYSIZE(buffer));
+        std::wstring name = Trim(buffer);
+        if (name.empty())
+        {
+            return;
+        }
+
+        if (name.find(L'.') == std::wstring::npos)
+        {
+            name += L".exe";
+        }
+
+        const std::wstring lowered = ToLower(name);
+        if (kProtectedProcesses.count(lowered) != 0)
+        {
+            MessageBoxW(hwnd, L"That process is protected and cannot be added.", kWindowTitle,
+                        MB_OK | MB_ICONWARNING);
+            return;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(g_stateMutex);
+            for (const AppEntry &app : g_state.apps)
+            {
+                if (ToLower(app.name) == lowered)
+                {
+                    MessageBoxW(hwnd, L"That app is already in the list.", kWindowTitle,
+                                MB_OK | MB_ICONINFORMATION);
+                    return;
+                }
+            }
+            g_state.apps.push_back({name, true});
+        }
+
+        SetWindowTextW(g_editApp, L"");
+        PersistState();
+        RefreshListView();
+        UpdateStatus();
+    }
+
+    void RemoveSelectedApps()
+    {
+        std::vector<int> selected;
+        int item = -1;
+        while ((item = ListView_GetNextItem(g_listView, item, LVNI_SELECTED)) != -1)
+        {
+            selected.push_back(item);
+        }
+        if (selected.empty())
+        {
+            return;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(g_stateMutex);
+            for (auto it = selected.rbegin(); it != selected.rend(); ++it)
+            {
+                if (*it >= 0 && static_cast<size_t>(*it) < g_state.apps.size())
+                {
+                    g_state.apps.erase(g_state.apps.begin() + *it);
+                }
+            }
+        }
+
+        PersistState();
+        RefreshListView();
+        UpdateStatus();
+    }
+
+    void ToggleActive()
+    {
+        {
+            std::lock_guard<std::mutex> lock(g_stateMutex);
+            g_state.active = !g_state.active;
+        }
+        PersistState();
+        UpdateStatus();
+    }
+
+    void CreateControls(HWND hwnd)
+    {
+        NONCLIENTMETRICSW metrics{};
+        metrics.cbSize = sizeof(metrics);
+        SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(metrics), &metrics, 0);
+        LOGFONTW logFont = metrics.lfMessageFont;
+        wcscpy_s(logFont.lfFaceName, L"Segoe UI");
+        logFont.lfHeight = -15;
+        g_uiFont = CreateFontIndirectW(&logFont);
+        logFont.lfHeight = -17;
+        logFont.lfWeight = FW_SEMIBOLD;
+        g_titleFont = CreateFontIndirectW(&logFont);
+
+        g_stateLabel = CreateWindowExW(0, L"STATIC", L"\u25CF Active", WS_CHILD | WS_VISIBLE,
+                                       0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDC_STATIC_STATE), g_instance, nullptr);
+        g_toggleButton = CreateWindowExW(0, L"BUTTON", L"Pause", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+                                         0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDC_BTN_TOGGLE), g_instance, nullptr);
+
+        g_editApp = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+                                    WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+                                    0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDC_EDIT_APP), g_instance, nullptr);
+        SendMessageW(g_editApp, EM_SETCUEBANNER, TRUE,
+                     reinterpret_cast<LPARAM>(L"Process name, e.g. notepad.exe"));
+
+        CreateWindowExW(0, L"BUTTON", L"Add", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+                        0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDC_BTN_ADD), g_instance, nullptr);
+
+        g_listView = CreateWindowExW(0, WC_LISTVIEWW, L"",
+                                     WS_CHILD | WS_VISIBLE | WS_TABSTOP | LVS_REPORT | LVS_SHOWSELALWAYS | LVS_NOCOLUMNHEADER,
+                                     0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDC_LIST_APPS), g_instance, nullptr);
+        ListView_SetExtendedListViewStyle(g_listView,
+                                          LVS_EX_CHECKBOXES | LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
+        SetWindowTheme(g_listView, L"Explorer", nullptr);
+
+        LVCOLUMNW column{};
+        column.mask = LVCF_WIDTH;
+        column.cx = 400;
+        ListView_InsertColumn(g_listView, 0, &column);
+
+        CreateWindowExW(0, L"BUTTON", L"Remove selected", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+                        0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDC_BTN_REMOVE), g_instance, nullptr);
+        g_startupCheck = CreateWindowExW(0, L"BUTTON", L"Run on startup",
+                                         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+                                         0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDC_CHK_STARTUP), g_instance, nullptr);
+        Button_SetCheck(g_startupCheck, IsStartupEnabled() ? BST_CHECKED : BST_UNCHECKED);
+
+        g_statusLabel = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE,
+                                        0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDC_STATIC_STATUS), g_instance, nullptr);
+
+        EnumChildWindows(hwnd, [](HWND child, LPARAM font) -> BOOL
+                         {
+                             SendMessageW(child, WM_SETFONT, static_cast<WPARAM>(font), TRUE);
+                             return TRUE;
+                         },
+                         reinterpret_cast<LPARAM>(g_uiFont));
+        SendMessageW(g_stateLabel, WM_SETFONT, reinterpret_cast<WPARAM>(g_titleFont), TRUE);
+    }
+
+    void LayoutControls(HWND hwnd)
+    {
+        RECT client{};
+        GetClientRect(hwnd, &client);
+        const int width = client.right - client.left;
+        const int height = client.bottom - client.top;
+        const int margin = 16;
+        const int rowHeight = 30;
+
+        MoveWindow(g_stateLabel, margin, margin, width - margin * 2 - 110, rowHeight, TRUE);
+        MoveWindow(g_toggleButton, width - margin - 100, margin - 2, 100, rowHeight, TRUE);
+
+        const int editTop = margin + rowHeight + 10;
+        MoveWindow(g_editApp, margin, editTop, width - margin * 2 - 90, rowHeight - 4, TRUE);
+        MoveWindow(GetDlgItem(hwnd, IDC_BTN_ADD), width - margin - 80, editTop - 1, 80, rowHeight - 2, TRUE);
+
+        const int listTop = editTop + rowHeight + 8;
+        const int bottomArea = 76;
+        MoveWindow(g_listView, margin, listTop, width - margin * 2,
+                   height - listTop - bottomArea, TRUE);
+        ListView_SetColumnWidth(g_listView, 0, width - margin * 2 - GetSystemMetrics(SM_CXVSCROLL) - 6);
+
+        const int buttonsTop = height - bottomArea + 8;
+        MoveWindow(GetDlgItem(hwnd, IDC_BTN_REMOVE), margin, buttonsTop, 130, rowHeight - 2, TRUE);
+        MoveWindow(g_startupCheck, margin + 144, buttonsTop + 3, 160, rowHeight - 6, TRUE);
+        MoveWindow(g_statusLabel, margin, height - 28, width - margin * 2, 20, TRUE);
+    }
+
+    void HandleListItemChanged(const NMLISTVIEW *info)
+    {
+        if (g_suppressListNotifications || info->iItem < 0)
+        {
+            return;
+        }
+        // Detect state-image (checkbox) changes.
+        if ((info->uChanged & LVIF_STATE) == 0 ||
+            ((info->uNewState ^ info->uOldState) & LVIS_STATEIMAGEMASK) == 0 ||
+            (info->uOldState & LVIS_STATEIMAGEMASK) == 0)
+        {
+            return;
+        }
+
+        const bool checked = ListView_GetCheckState(g_listView, info->iItem) != FALSE;
+        {
+            std::lock_guard<std::mutex> lock(g_stateMutex);
+            if (static_cast<size_t>(info->iItem) < g_state.apps.size())
+            {
+                g_state.apps[static_cast<size_t>(info->iItem)].enabled = checked;
+            }
+        }
+        PersistState();
+        UpdateStatus();
+    }
+
+    void ExitApplication(HWND hwnd)
+    {
+        RemoveTrayIcon();
+        DestroyWindow(hwnd);
+    }
+
+    LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
+    {
+        switch (message)
+        {
+        case WM_CREATE:
+            CreateControls(hwnd);
+            AddTrayIcon(hwnd);
+            RefreshListView();
+            UpdateStatus();
+            return 0;
+
+        case WM_SIZE:
+            if (wParam == SIZE_MINIMIZED)
+            {
+                ShowWindow(hwnd, SW_HIDE);
+                ShowTrayBalloonOnce();
             }
             else
             {
-                std::wcerr << L"Config reload failed. Keeping previous config.\n";
+                LayoutControls(hwnd);
             }
+            return 0;
+
+        case WM_GETMINMAXINFO:
+        {
+            MINMAXINFO *info = reinterpret_cast<MINMAXINFO *>(lParam);
+            info->ptMinTrackSize.x = 380;
+            info->ptMinTrackSize.y = 420;
+            return 0;
         }
 
-        const std::vector<DWORD> targetPids = FindTargetPids(targets);
-
-        unsigned int killedCount = 0;
-        for (const DWORD pid : targetPids)
+        case WM_CTLCOLORSTATIC:
         {
-            if (KillProcessByPid(pid))
+            HDC dc = reinterpret_cast<HDC>(wParam);
+            SetBkColor(dc, RGB(255, 255, 255));
+            if (reinterpret_cast<HWND>(lParam) == g_stateLabel)
             {
-                ++killedCount;
+                bool active = false;
+                {
+                    std::lock_guard<std::mutex> lock(g_stateMutex);
+                    active = g_state.active;
+                }
+                SetTextColor(dc, active ? RGB(22, 138, 61) : RGB(196, 119, 0));
             }
-        }
-
-        if (killedCount > 0)
-        {
-            idleLoops = 0;
-            std::wcout << L"Killed " << killedCount << L" process(es).\n";
-        }
-        else
-        {
-            ++idleLoops;
-            if (idleLoops >= config->noHitLogEveryLoops)
+            else if (reinterpret_cast<HWND>(lParam) == g_statusLabel)
             {
-                std::wcout << L"No target process found.\n";
-                idleLoops = 0;
+                SetTextColor(dc, RGB(110, 110, 110));
             }
+            return reinterpret_cast<LRESULT>(g_backgroundBrush);
         }
 
-        std::this_thread::sleep_for(std::chrono::milliseconds(config->intervalMs));
+        case WM_CTLCOLORBTN:
+            return reinterpret_cast<LRESULT>(g_backgroundBrush);
+
+        case WM_COMMAND:
+            switch (LOWORD(wParam))
+            {
+            case IDC_BTN_ADD:
+            case IDOK: // Enter key via IsDialogMessage
+                AddAppFromEdit(hwnd);
+                return 0;
+            case IDC_BTN_REMOVE:
+                RemoveSelectedApps();
+                return 0;
+            case IDC_BTN_TOGGLE:
+            case IDM_TRAY_TOGGLE:
+                ToggleActive();
+                return 0;
+            case IDC_CHK_STARTUP:
+                SetStartupEnabled(Button_GetCheck(g_startupCheck) == BST_CHECKED);
+                return 0;
+            case IDM_TRAY_STARTUP:
+                SetStartupEnabled(!IsStartupEnabled());
+                Button_SetCheck(g_startupCheck, IsStartupEnabled() ? BST_CHECKED : BST_UNCHECKED);
+                return 0;
+            case IDM_TRAY_OPEN:
+                ShowWindow(hwnd, SW_SHOW);
+                ShowWindow(hwnd, SW_RESTORE);
+                SetForegroundWindow(hwnd);
+                return 0;
+            case IDM_TRAY_EXIT:
+                ExitApplication(hwnd);
+                return 0;
+            default:
+                break;
+            }
+            break;
+
+        case WM_NOTIFY:
+        {
+            const NMHDR *header = reinterpret_cast<const NMHDR *>(lParam);
+            if (header->idFrom == IDC_LIST_APPS && header->code == LVN_ITEMCHANGED)
+            {
+                HandleListItemChanged(reinterpret_cast<const NMLISTVIEW *>(lParam));
+            }
+            else if (header->idFrom == IDC_LIST_APPS && header->code == LVN_KEYDOWN)
+            {
+                const NMLVKEYDOWN *key = reinterpret_cast<const NMLVKEYDOWN *>(lParam);
+                if (key->wVKey == VK_DELETE)
+                {
+                    RemoveSelectedApps();
+                }
+            }
+            break;
+        }
+
+        case WM_TRAYICON:
+            switch (LOWORD(lParam))
+            {
+            case WM_LBUTTONDBLCLK:
+                SendMessageW(hwnd, WM_COMMAND, IDM_TRAY_OPEN, 0);
+                break;
+            case WM_RBUTTONUP:
+            case WM_CONTEXTMENU:
+                ShowTrayMenu(hwnd);
+                break;
+            default:
+                break;
+            }
+            return 0;
+
+        case WM_APP + 2: // kill-count update from worker thread
+            UpdateStatus();
+            return 0;
+
+        case WM_CLOSE: // close button hides to tray; exit via tray menu
+            ShowWindow(hwnd, SW_HIDE);
+            ShowTrayBalloonOnce();
+            return 0;
+
+        case WM_DESTROY:
+            PostQuitMessage(0);
+            return 0;
+
+        default:
+            break;
+        }
+
+        return DefWindowProcW(hwnd, message, wParam, lParam);
+    }
+} // namespace
+
+int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR commandLine, int)
+{
+    g_instance = hInstance;
+
+    HANDLE mutex = CreateMutexW(nullptr, TRUE, kMutexName);
+    if (mutex != nullptr && GetLastError() == ERROR_ALREADY_EXISTS)
+    {
+        HWND existing = FindWindowW(kWindowClass, nullptr);
+        if (existing != nullptr)
+        {
+            ShowWindow(existing, SW_SHOW);
+            ShowWindow(existing, SW_RESTORE);
+            SetForegroundWindow(existing);
+        }
+        CloseHandle(mutex);
+        return 0;
     }
 
-    std::wcout << L"Stopping MinimalAppKiller.\n";
-    return 0;
+    const bool startMinimized = commandLine != nullptr && wcsstr(commandLine, L"--minimized") != nullptr;
+
+    INITCOMMONCONTROLSEX icc{};
+    icc.dwSize = sizeof(icc);
+    icc.dwICC = ICC_LISTVIEW_CLASSES | ICC_STANDARD_CLASSES;
+    InitCommonControlsEx(&icc);
+
+    LoadSettings(g_state);
+
+    g_backgroundBrush = CreateSolidBrush(RGB(255, 255, 255));
+
+    WNDCLASSEXW windowClass{};
+    windowClass.cbSize = sizeof(windowClass);
+    windowClass.lpfnWndProc = WndProc;
+    windowClass.hInstance = hInstance;
+    windowClass.hIcon = LoadIconW(hInstance, MAKEINTRESOURCEW(IDI_APPICON));
+    windowClass.hIconSm = static_cast<HICON>(LoadImageW(hInstance, MAKEINTRESOURCEW(IDI_APPICON), IMAGE_ICON,
+                                                        GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), 0));
+    windowClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    windowClass.hbrBackground = g_backgroundBrush;
+    windowClass.lpszClassName = kWindowClass;
+    RegisterClassExW(&windowClass);
+
+    g_mainWindow = CreateWindowExW(0, kWindowClass, kWindowTitle,
+                                   WS_OVERLAPPEDWINDOW,
+                                   CW_USEDEFAULT, CW_USEDEFAULT, 440, 520,
+                                   nullptr, nullptr, hInstance, nullptr);
+    if (g_mainWindow == nullptr)
+    {
+        if (mutex != nullptr)
+        {
+            CloseHandle(mutex);
+        }
+        return 1;
+    }
+
+    ShowWindow(g_mainWindow, startMinimized ? SW_HIDE : SW_SHOW);
+    if (!startMinimized)
+    {
+        UpdateWindow(g_mainWindow);
+    }
+
+    g_workerThread = std::thread(WorkerLoop);
+
+    MSG msg{};
+    while (GetMessageW(&msg, nullptr, 0, 0) > 0)
+    {
+        if (IsDialogMessageW(g_mainWindow, &msg))
+        {
+            continue;
+        }
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+
+    g_workerRunning = false;
+    if (g_workerThread.joinable())
+    {
+        g_workerThread.join();
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_stateMutex);
+        SaveSettings(g_state);
+    }
+
+    if (g_uiFont != nullptr)
+    {
+        DeleteObject(g_uiFont);
+    }
+    if (g_titleFont != nullptr)
+    {
+        DeleteObject(g_titleFont);
+    }
+    if (g_backgroundBrush != nullptr)
+    {
+        DeleteObject(g_backgroundBrush);
+    }
+    if (mutex != nullptr)
+    {
+        CloseHandle(mutex);
+    }
+
+    return static_cast<int>(msg.wParam);
 }

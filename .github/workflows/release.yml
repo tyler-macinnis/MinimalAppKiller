@@ -1,0 +1,96 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release (e.g. 1.0.0) — must match a CHANGELOG entry"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: version
+        shell: pwsh
+        run: |
+          if ('${{ github.event_name }}' -eq 'workflow_dispatch') {
+            $version = '${{ inputs.version }}'.TrimStart('v')
+          } else {
+            $version = '${{ github.ref_name }}'.TrimStart('v')
+          }
+          if ($version -notmatch '^\d+\.\d+\.\d+$') {
+            Write-Error "Invalid version: '$version' (expected e.g. 1.0.0)"
+            exit 1
+          }
+          "version=$version" >> $env:GITHUB_OUTPUT
+          Write-Host "Releasing version $version"
+
+      - name: Verify version matches the app
+        shell: pwsh
+        run: |
+          $expected = '${{ steps.version.outputs.version }}'
+          $line = Select-String -Path MinimalAppKiller/version.h -Pattern 'APP_VERSION_STRING "(.+)"'
+          $actual = $line.Matches[0].Groups[1].Value
+          if ($actual -ne $expected) {
+            Write-Error "APP_VERSION_STRING in MinimalAppKiller/version.h is '$actual' but releasing '$expected'. Update it first."
+            exit 1
+          }
+
+      - name: Extract release notes from CHANGELOG
+        id: notes
+        shell: pwsh
+        run: |
+          $version = '${{ steps.version.outputs.version }}'
+          $content = Get-Content CHANGELOG.md -Raw
+          $pattern = "(?ms)^## \[$([regex]::Escape($version))\][^\r\n]*\r?\n(.*?)(?=^## \[|\z)"
+          $match = [regex]::Match($content, $pattern)
+          if (-not $match.Success) {
+            Write-Error "No CHANGELOG.md entry found for version $version. Add one before releasing."
+            exit 1
+          }
+          $notes = $match.Groups[1].Value.Trim()
+          Set-Content -Path release_notes.md -Value $notes -Encoding utf8
+          Write-Host "Release notes:`n$notes"
+
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Build (Release x64)
+        run: msbuild MinimalAppKiller.sln /t:Build /p:Configuration=Release /p:Platform=x64 /p:PlatformToolset=v143
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          $version = '${{ steps.version.outputs.version }}'
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" installer\MinimalAppKiller.iss /DAppVersion=$version
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          $version = '${{ steps.version.outputs.version }}'
+          $tag = "v$version"
+          # Create the tag if this was a manual dispatch without one
+          if ('${{ github.event_name }}' -eq 'workflow_dispatch') {
+            git tag $tag 2>$null
+            git push origin $tag 2>$null
+          }
+          gh release create $tag `
+            --title "Minimal App Killer $version" `
+            --notes-file release_notes.md `
+            "dist/MinimalAppKiller-$version-setup.exe#MinimalAppKiller.$version.Setup.exe" `
+            "x64/Release/MinimalAppKiller.exe#MinimalAppKiller.$version.portable.exe"

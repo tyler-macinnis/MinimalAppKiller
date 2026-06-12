@@ -4,7 +4,8 @@ A lightweight, clean Windows desktop app that automatically terminates the appli
 
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-blue)
 ![Language](https://img.shields.io/badge/language-C%2B%2B20-orange)
-![License](https://img.shields.io/badge/dependencies-none-brightgreen)
+![License](https://img.shields.io/badge/license-MIT-green)
+![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen)
 
 ## Features
 

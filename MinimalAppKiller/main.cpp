@@ -75,6 +75,7 @@ namespace
     std::atomic<bool> g_workerRunning{true};
     std::atomic<unsigned long long> g_killCount{0};
     std::thread g_workerThread;
+    HANDLE g_workerStopEvent = nullptr;
 
     // Processes that must never be added as kill targets.
     const std::unordered_set<std::wstring> kProtectedProcesses = {
@@ -344,9 +345,14 @@ namespace
                 }
             }
 
-            for (unsigned int waited = 0; waited < kScanIntervalMs && g_workerRunning; waited += 100)
+            // Sleep until the next scan, waking immediately if shutdown is requested.
+            if (g_workerStopEvent == nullptr)
             {
-                Sleep(100);
+                Sleep(kScanIntervalMs);
+            }
+            else if (WaitForSingleObject(g_workerStopEvent, kScanIntervalMs) != WAIT_TIMEOUT)
+            {
+                break;
             }
         }
     }
@@ -876,6 +882,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR commandLine, int)
         UpdateWindow(g_mainWindow);
     }
 
+    g_workerStopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     g_workerThread = std::thread(WorkerLoop);
 
     MSG msg{};
@@ -890,9 +897,18 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR commandLine, int)
     }
 
     g_workerRunning = false;
+    if (g_workerStopEvent != nullptr)
+    {
+        SetEvent(g_workerStopEvent);
+    }
     if (g_workerThread.joinable())
     {
         g_workerThread.join();
+    }
+    if (g_workerStopEvent != nullptr)
+    {
+        CloseHandle(g_workerStopEvent);
+        g_workerStopEvent = nullptr;
     }
 
     {

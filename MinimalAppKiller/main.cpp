@@ -6,6 +6,7 @@
 #include <windows.h>
 #include <windowsx.h>
 #include <commctrl.h>
+#include <dwmapi.h>
 #include <shellapi.h>
 #include <shlobj.h>
 #include <tlhelp32.h>
@@ -14,6 +15,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cwctype>
+#include <filesystem>
 #include <fstream>
 #include <mutex>
 #include <string>
@@ -26,6 +28,7 @@
 
 #ifdef _MSC_VER
 #pragma comment(lib, "comctl32.lib")
+#pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "uxtheme.lib")
 #pragma comment(lib, "advapi32.lib")
@@ -39,6 +42,7 @@ namespace
     constexpr wchar_t kRunKeyPath[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
     constexpr wchar_t kRunValueName[] = L"MinimalAppKiller";
     constexpr UINT WM_TRAYICON = WM_APP + 1;
+    constexpr UINT WM_KILLCOUNT = WM_APP + 2; // posted by the worker after it kills something
     constexpr UINT kTrayIconId = 1;
     constexpr unsigned int kScanIntervalMs = 1000;
 
@@ -63,18 +67,27 @@ namespace
     HWND g_stateLabel = nullptr;
     HWND g_toggleButton = nullptr;
     HWND g_startupCheck = nullptr;
-    HFONT g_uiFont = nullptr;
-    HFONT g_titleFont = nullptr;
+    // Windows 11 surface and text colours; the app follows the system light/dark setting.
+    struct Theme
+    {
+        COLORREF window, card, text, subtle, active, paused;
+    };
+    constexpr Theme kLight{RGB(243, 243, 243), RGB(255, 255, 255), RGB(27, 27, 27),
+                           RGB(96, 96, 96), RGB(15, 123, 15), RGB(157, 93, 0)};
+    constexpr Theme kDark{RGB(32, 32, 32), RGB(43, 43, 43), RGB(255, 255, 255),
+                          RGB(200, 200, 200), RGB(108, 203, 95), RGB(252, 225, 0)};
+    const Theme *g_theme = &kLight;
     HBRUSH g_backgroundBrush = nullptr;
+    HBRUSH g_cardBrush = nullptr;
+    // shortcut: sized for the primary monitor's DPI only, handle WM_DPICHANGED if mixed-DPI setups matter
+    int g_dpi = 96;
     NOTIFYICONDATAW g_trayIcon{};
     bool g_trayBalloonShown = false;
     bool g_suppressListNotifications = false;
 
     AppState g_state;
     std::mutex g_stateMutex;
-    std::atomic<bool> g_workerRunning{true};
     std::atomic<unsigned long long> g_killCount{0};
-    std::thread g_workerThread;
     HANDLE g_workerStopEvent = nullptr;
 
     // Processes that must never be added as kill targets.
@@ -82,6 +95,12 @@ namespace
         L"minimalappkiller.exe", L"csrss.exe", L"wininit.exe", L"winlogon.exe",
         L"services.exe", L"lsass.exe", L"smss.exe", L"svchost.exe",
         L"system", L"system idle process", L"dwm.exe"};
+
+    // Scales a 96-DPI pixel measurement to the display.
+    int S(int px)
+    {
+        return MulDiv(px, g_dpi, 96);
+    }
 
     std::wstring Trim(const std::wstring &value)
     {
@@ -131,42 +150,22 @@ namespace
 
     // ---------------- Settings persistence ----------------
 
-    std::wstring SettingsDirectory()
+    // Empty on failure, which simply makes the file streams below fail to open.
+    std::filesystem::path SettingsPath()
     {
         wchar_t appData[MAX_PATH]{};
         if (FAILED(SHGetFolderPathW(nullptr, CSIDL_APPDATA, nullptr, SHGFP_TYPE_CURRENT, appData)))
         {
-            return std::wstring();
+            return {};
         }
-        std::wstring dir = std::wstring(appData) + L"\\MinimalAppKiller";
+        const std::wstring dir = std::wstring(appData) + L"\\MinimalAppKiller";
         CreateDirectoryW(dir.c_str(), nullptr);
-        return dir;
-    }
-
-    std::wstring SettingsPath()
-    {
-        const std::wstring dir = SettingsDirectory();
-        if (dir.empty())
-        {
-            return std::wstring();
-        }
         return dir + L"\\settings.ini";
     }
 
     void LoadSettings(AppState &state)
     {
-        const std::wstring path = SettingsPath();
-        if (path.empty())
-        {
-            return;
-        }
-
-        std::ifstream file(WideToUtf8(path).c_str());
-        if (!file)
-        {
-            return;
-        }
-
+        std::ifstream file(SettingsPath());
         std::unordered_set<std::wstring> seen;
         std::string rawLine;
         while (std::getline(file, rawLine))
@@ -208,18 +207,7 @@ namespace
 
     void SaveSettings(const AppState &state)
     {
-        const std::wstring path = SettingsPath();
-        if (path.empty())
-        {
-            return;
-        }
-
-        std::ofstream file(WideToUtf8(path).c_str(), std::ios::trunc);
-        if (!file)
-        {
-            return;
-        }
-
+        std::ofstream file(SettingsPath(), std::ios::trunc);
         file << "# MinimalAppKiller settings\n";
         file << "active=" << (state.active ? 1 : 0) << "\n";
         for (const AppEntry &app : state.apps)
@@ -308,7 +296,8 @@ namespace
 
     void WorkerLoop()
     {
-        while (g_workerRunning)
+        // Scan, then sleep one interval; the stop event ends the wait (and the loop) at once.
+        do
         {
             std::unordered_set<std::wstring> targets;
             {
@@ -325,36 +314,25 @@ namespace
                 }
             }
 
-            if (!targets.empty())
+            if (targets.empty())
             {
-                unsigned int killed = 0;
-                for (const DWORD pid : FindTargetPids(targets))
-                {
-                    if (KillProcessByPid(pid))
-                    {
-                        ++killed;
-                    }
-                }
-                if (killed > 0)
-                {
-                    g_killCount += killed;
-                    if (g_mainWindow != nullptr)
-                    {
-                        PostMessageW(g_mainWindow, WM_APP + 2, 0, 0);
-                    }
-                }
+                continue;
             }
 
-            // Sleep until the next scan, waking immediately if shutdown is requested.
-            if (g_workerStopEvent == nullptr)
+            unsigned int killed = 0;
+            for (const DWORD pid : FindTargetPids(targets))
             {
-                Sleep(kScanIntervalMs);
+                if (KillProcessByPid(pid))
+                {
+                    ++killed;
+                }
             }
-            else if (WaitForSingleObject(g_workerStopEvent, kScanIntervalMs) != WAIT_TIMEOUT)
+            if (killed > 0)
             {
-                break;
+                g_killCount += killed;
+                PostMessageW(g_mainWindow, WM_KILLCOUNT, 0, 0);
             }
-        }
+        } while (WaitForSingleObject(g_workerStopEvent, kScanIntervalMs) == WAIT_TIMEOUT);
     }
 
     // ---------------- Tray icon ----------------
@@ -562,6 +540,43 @@ namespace
         UpdateStatus();
     }
 
+    // Re-reads the system light/dark setting and restyles the window and every control.
+    void ApplyTheme(HWND hwnd)
+    {
+        DWORD light = 1;
+        DWORD size = sizeof(light);
+        RegGetValueW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+                     L"AppsUseLightTheme", RRF_RT_REG_DWORD, nullptr, &light, &size);
+        const BOOL dark = light == 0;
+        g_theme = dark ? &kDark : &kLight;
+
+        DeleteObject(g_backgroundBrush);
+        DeleteObject(g_cardBrush);
+        g_backgroundBrush = CreateSolidBrush(g_theme->window);
+        g_cardBrush = CreateSolidBrush(g_theme->card);
+
+        // Title bar: dark caption buttons, and on Windows 11 the same colour as the window body.
+        DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark, sizeof(dark));
+        DwmSetWindowAttribute(hwnd, DWMWA_CAPTION_COLOR, &g_theme->window, sizeof(COLORREF));
+
+        EnumChildWindows(hwnd, [](HWND child, LPARAM dark) -> BOOL
+                         {
+                             SetWindowTheme(child, dark ? L"DarkMode_Explorer" : nullptr, nullptr);
+                             return TRUE;
+                         },
+                         dark);
+        SetWindowTheme(g_listView, dark ? L"DarkMode_Explorer" : L"Explorer", nullptr);
+        if (dark)
+        {
+            SetWindowTheme(g_editApp, L"DarkMode_CFD", nullptr);
+        }
+        ListView_SetBkColor(g_listView, g_theme->card);
+        ListView_SetTextBkColor(g_listView, g_theme->card);
+        ListView_SetTextColor(g_listView, g_theme->text);
+
+        RedrawWindow(hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_FRAME);
+    }
+
     void CreateControls(HWND hwnd)
     {
         NONCLIENTMETRICSW metrics{};
@@ -569,83 +584,83 @@ namespace
         SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(metrics), &metrics, 0);
         LOGFONTW logFont = metrics.lfMessageFont;
         wcscpy_s(logFont.lfFaceName, L"Segoe UI");
-        logFont.lfHeight = -15;
-        g_uiFont = CreateFontIndirectW(&logFont);
-        logFont.lfHeight = -17;
+        logFont.lfHeight = -S(15);
+        // Both fonts live as long as the (only) window, so they are never freed.
+        const HFONT uiFont = CreateFontIndirectW(&logFont);
+        logFont.lfHeight = -S(20);
         logFont.lfWeight = FW_SEMIBOLD;
-        g_titleFont = CreateFontIndirectW(&logFont);
+        const HFONT titleFont = CreateFontIndirectW(&logFont);
 
-        g_stateLabel = CreateWindowExW(0, L"STATIC", L"\u25CF Active", WS_CHILD | WS_VISIBLE,
-                                       0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDC_STATIC_STATE), g_instance, nullptr);
-        g_toggleButton = CreateWindowExW(0, L"BUTTON", L"Pause", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-                                         0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDC_BTN_TOGGLE), g_instance, nullptr);
+        // Positions are set by LayoutControls; creation order is the tab order.
+        const auto make = [&](const wchar_t *cls, const wchar_t *text, DWORD style, int id, DWORD exStyle = 0)
+        {
+            const HWND control = CreateWindowExW(exStyle, cls, text, WS_CHILD | WS_VISIBLE | style, 0, 0, 0, 0, hwnd,
+                                                 reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), g_instance, nullptr);
+            SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(uiFont), TRUE);
+            return control;
+        };
 
-        g_editApp = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
-                                    WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
-                                    0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDC_EDIT_APP), g_instance, nullptr);
+        g_stateLabel = make(L"STATIC", L"", SS_CENTERIMAGE, IDC_STATIC_STATE);
+        SendMessageW(g_stateLabel, WM_SETFONT, reinterpret_cast<WPARAM>(titleFont), TRUE);
+        g_toggleButton = make(L"BUTTON", L"", WS_TABSTOP, IDC_BTN_TOGGLE);
+
+        g_editApp = make(L"EDIT", L"", WS_TABSTOP | ES_AUTOHSCROLL, IDC_EDIT_APP, WS_EX_CLIENTEDGE);
         SendMessageW(g_editApp, EM_SETCUEBANNER, TRUE,
                      reinterpret_cast<LPARAM>(L"Process name, e.g. notepad.exe"));
+        make(L"BUTTON", L"Add", WS_TABSTOP | BS_DEFPUSHBUTTON, IDC_BTN_ADD);
 
-        CreateWindowExW(0, L"BUTTON", L"Add", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
-                        0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDC_BTN_ADD), g_instance, nullptr);
-
-        g_listView = CreateWindowExW(0, WC_LISTVIEWW, L"",
-                                     WS_CHILD | WS_VISIBLE | WS_TABSTOP | LVS_REPORT | LVS_SHOWSELALWAYS | LVS_NOCOLUMNHEADER,
-                                     0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDC_LIST_APPS), g_instance, nullptr);
+        g_listView = make(WC_LISTVIEWW, L"", WS_TABSTOP | LVS_REPORT | LVS_SHOWSELALWAYS | LVS_NOCOLUMNHEADER,
+                          IDC_LIST_APPS);
         ListView_SetExtendedListViewStyle(g_listView,
                                           LVS_EX_CHECKBOXES | LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
-        SetWindowTheme(g_listView, L"Explorer", nullptr);
-
+        // A 1px-wide image list is the standard way to get taller, roomier rows.
+        ListView_SetImageList(g_listView, ImageList_Create(1, S(30), ILC_COLOR, 1, 0), LVSIL_SMALL);
         LVCOLUMNW column{};
-        column.mask = LVCF_WIDTH;
-        column.cx = 400;
-        ListView_InsertColumn(g_listView, 0, &column);
+        ListView_InsertColumn(g_listView, 0, &column); // width is set by LayoutControls
 
-        CreateWindowExW(0, L"BUTTON", L"Remove selected", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-                        0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDC_BTN_REMOVE), g_instance, nullptr);
-        g_startupCheck = CreateWindowExW(0, L"BUTTON", L"Run on startup",
-                                         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
-                                         0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDC_CHK_STARTUP), g_instance, nullptr);
+        make(L"BUTTON", L"Remove selected", WS_TABSTOP, IDC_BTN_REMOVE);
+        g_startupCheck = make(L"BUTTON", L"Run on startup", WS_TABSTOP | BS_AUTOCHECKBOX, IDC_CHK_STARTUP);
         Button_SetCheck(g_startupCheck, IsStartupEnabled() ? BST_CHECKED : BST_UNCHECKED);
+        // Themed checkboxes always draw their own text black, which is unreadable in dark mode. So the
+        // checkbox is laid out box-only (its text stays as the accessible name) with this label beside it.
+        make(L"STATIC", L"Run on startup", SS_NOTIFY | SS_CENTERIMAGE, IDC_LBL_STARTUP);
 
-        g_statusLabel = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE,
-                                        0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDC_STATIC_STATUS), g_instance, nullptr);
-
-        EnumChildWindows(hwnd, [](HWND child, LPARAM font) -> BOOL
-                         {
-                             SendMessageW(child, WM_SETFONT, static_cast<WPARAM>(font), TRUE);
-                             return TRUE;
-                         },
-                         reinterpret_cast<LPARAM>(g_uiFont));
-        SendMessageW(g_stateLabel, WM_SETFONT, reinterpret_cast<WPARAM>(g_titleFont), TRUE);
+        g_statusLabel = make(L"STATIC", L"", 0, IDC_STATIC_STATUS);
+        ApplyTheme(hwnd);
     }
 
     void LayoutControls(HWND hwnd)
     {
         RECT client{};
         GetClientRect(hwnd, &client);
-        const int width = client.right - client.left;
-        const int height = client.bottom - client.top;
-        const int margin = 16;
-        const int rowHeight = 30;
+        const int width = client.right;
+        const int height = client.bottom;
+        const int margin = S(20);
+        const int row = S(30);
+        const int gap = S(12);
+        const int inner = width - margin * 2;
+        const int statusHeight = S(20);
 
-        MoveWindow(g_stateLabel, margin, margin, width - margin * 2 - 110, rowHeight, TRUE);
-        MoveWindow(g_toggleButton, width - margin - 100, margin - 2, 100, rowHeight, TRUE);
+        // Header: state on the left, pause/resume on the right.
+        int y = margin;
+        MoveWindow(g_stateLabel, margin, y, inner - S(112), row, TRUE);
+        MoveWindow(g_toggleButton, width - margin - S(100), y, S(100), row, TRUE);
 
-        const int editTop = margin + rowHeight + 10;
-        MoveWindow(g_editApp, margin, editTop, width - margin * 2 - 90, rowHeight - 4, TRUE);
-        MoveWindow(GetDlgItem(hwnd, IDC_BTN_ADD), width - margin - 80, editTop - 1, 80, rowHeight - 2, TRUE);
+        // Add row.
+        y += row + gap;
+        MoveWindow(g_editApp, margin, y + S(1), inner - S(92), row - S(2), TRUE);
+        MoveWindow(GetDlgItem(hwnd, IDC_BTN_ADD), width - margin - S(80), y, S(80), row, TRUE);
 
-        const int listTop = editTop + rowHeight + 8;
-        const int bottomArea = 76;
-        MoveWindow(g_listView, margin, listTop, width - margin * 2,
-                   height - listTop - bottomArea, TRUE);
-        ListView_SetColumnWidth(g_listView, 0, width - margin * 2 - GetSystemMetrics(SM_CXVSCROLL) - 6);
+        // List fills whatever is left above the footer (action row + status line).
+        y += row + gap;
+        const int footerTop = height - margin - statusHeight - gap - row;
+        MoveWindow(g_listView, margin, y, inner, footerTop - gap - y, TRUE);
+        ListView_SetColumnWidth(g_listView, 0, LVSCW_AUTOSIZE_USEHEADER); // fill the list's width
 
-        const int buttonsTop = height - bottomArea + 8;
-        MoveWindow(GetDlgItem(hwnd, IDC_BTN_REMOVE), margin, buttonsTop, 130, rowHeight - 2, TRUE);
-        MoveWindow(g_startupCheck, margin + 144, buttonsTop + 3, 160, rowHeight - 6, TRUE);
-        MoveWindow(g_statusLabel, margin, height - 28, width - margin * 2, 20, TRUE);
+        MoveWindow(GetDlgItem(hwnd, IDC_BTN_REMOVE), margin, footerTop, S(130), row, TRUE);
+        MoveWindow(g_startupCheck, margin + S(146), footerTop, S(15), row, TRUE);
+        MoveWindow(GetDlgItem(hwnd, IDC_LBL_STARTUP), margin + S(168), footerTop, S(140), row, TRUE);
+        MoveWindow(g_statusLabel, margin, height - margin - statusHeight, inner, statusHeight, TRUE);
     }
 
     void HandleListItemChanged(const NMLISTVIEW *info)
@@ -674,10 +689,11 @@ namespace
         UpdateStatus();
     }
 
-    void ExitApplication(HWND hwnd)
+    void ShowMainWindow(HWND hwnd)
     {
-        RemoveTrayIcon();
-        DestroyWindow(hwnd);
+        ShowWindow(hwnd, SW_SHOW);
+        ShowWindow(hwnd, SW_RESTORE);
+        SetForegroundWindow(hwnd);
     }
 
     LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
@@ -706,33 +722,51 @@ namespace
         case WM_GETMINMAXINFO:
         {
             MINMAXINFO *info = reinterpret_cast<MINMAXINFO *>(lParam);
-            info->ptMinTrackSize.x = 380;
-            info->ptMinTrackSize.y = 420;
+            info->ptMinTrackSize.x = S(380);
+            info->ptMinTrackSize.y = S(420);
             return 0;
         }
 
         case WM_CTLCOLORSTATIC:
         {
             HDC dc = reinterpret_cast<HDC>(wParam);
-            SetBkColor(dc, RGB(255, 255, 255));
+            COLORREF color = g_theme->text;
             if (reinterpret_cast<HWND>(lParam) == g_stateLabel)
             {
-                bool active = false;
-                {
-                    std::lock_guard<std::mutex> lock(g_stateMutex);
-                    active = g_state.active;
-                }
-                SetTextColor(dc, active ? RGB(22, 138, 61) : RGB(196, 119, 0));
+                std::lock_guard<std::mutex> lock(g_stateMutex);
+                color = g_state.active ? g_theme->active : g_theme->paused;
             }
             else if (reinterpret_cast<HWND>(lParam) == g_statusLabel)
             {
-                SetTextColor(dc, RGB(110, 110, 110));
+                color = g_theme->subtle;
             }
+            SetTextColor(dc, color);
+            SetBkColor(dc, g_theme->window);
             return reinterpret_cast<LRESULT>(g_backgroundBrush);
         }
 
+        case WM_CTLCOLOREDIT:
+            SetTextColor(reinterpret_cast<HDC>(wParam), g_theme->text);
+            SetBkColor(reinterpret_cast<HDC>(wParam), g_theme->card);
+            return reinterpret_cast<LRESULT>(g_cardBrush);
+
         case WM_CTLCOLORBTN:
             return reinterpret_cast<LRESULT>(g_backgroundBrush);
+
+        case WM_ERASEBKGND:
+        {
+            RECT client{};
+            GetClientRect(hwnd, &client);
+            FillRect(reinterpret_cast<HDC>(wParam), &client, g_backgroundBrush);
+            return 1;
+        }
+
+        case WM_SETTINGCHANGE: // the user switched Windows between light and dark
+            if (lParam != 0 && wcscmp(reinterpret_cast<const wchar_t *>(lParam), L"ImmersiveColorSet") == 0)
+            {
+                ApplyTheme(hwnd);
+            }
+            break;
 
         case WM_COMMAND:
             switch (LOWORD(wParam))
@@ -751,17 +785,21 @@ namespace
             case IDC_CHK_STARTUP:
                 SetStartupEnabled(Button_GetCheck(g_startupCheck) == BST_CHECKED);
                 return 0;
+            case IDC_LBL_STARTUP:
+                if (HIWORD(wParam) == STN_CLICKED)
+                {
+                    SendMessageW(g_startupCheck, BM_CLICK, 0, 0);
+                }
+                return 0;
             case IDM_TRAY_STARTUP:
                 SetStartupEnabled(!IsStartupEnabled());
                 Button_SetCheck(g_startupCheck, IsStartupEnabled() ? BST_CHECKED : BST_UNCHECKED);
                 return 0;
             case IDM_TRAY_OPEN:
-                ShowWindow(hwnd, SW_SHOW);
-                ShowWindow(hwnd, SW_RESTORE);
-                SetForegroundWindow(hwnd);
+                ShowMainWindow(hwnd);
                 return 0;
             case IDM_TRAY_EXIT:
-                ExitApplication(hwnd);
+                DestroyWindow(hwnd);
                 return 0;
             default:
                 break;
@@ -774,6 +812,13 @@ namespace
             if (header->idFrom == IDC_LIST_APPS && header->code == LVN_ITEMCHANGED)
             {
                 HandleListItemChanged(reinterpret_cast<const NMLISTVIEW *>(lParam));
+            }
+            else if (header->idFrom == IDC_LIST_APPS && header->code == LVN_GETEMPTYMARKUP)
+            {
+                NMLVEMPTYMARKUP *markup = reinterpret_cast<NMLVEMPTYMARKUP *>(lParam);
+                markup->dwFlags = EMF_CENTERED;
+                wcscpy_s(markup->szMarkup, L"No apps yet. Add a process name above.");
+                return TRUE;
             }
             else if (header->idFrom == IDC_LIST_APPS && header->code == LVN_KEYDOWN)
             {
@@ -801,7 +846,7 @@ namespace
             }
             return 0;
 
-        case WM_APP + 2: // kill-count update from worker thread
+        case WM_KILLCOUNT:
             UpdateStatus();
             return 0;
 
@@ -811,6 +856,7 @@ namespace
             return 0;
 
         case WM_DESTROY:
+            RemoveTrayIcon();
             PostQuitMessage(0);
             return 0;
 
@@ -825,18 +871,16 @@ namespace
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR commandLine, int)
 {
     g_instance = hInstance;
+    g_dpi = static_cast<int>(GetDpiForSystem());
 
-    HANDLE mutex = CreateMutexW(nullptr, TRUE, kMutexName);
-    if (mutex != nullptr && GetLastError() == ERROR_ALREADY_EXISTS)
+    // Single instance: a second launch just surfaces the first. The mutex is held until exit.
+    CreateMutexW(nullptr, TRUE, kMutexName);
+    if (GetLastError() == ERROR_ALREADY_EXISTS)
     {
-        HWND existing = FindWindowW(kWindowClass, nullptr);
-        if (existing != nullptr)
+        if (const HWND existing = FindWindowW(kWindowClass, nullptr))
         {
-            ShowWindow(existing, SW_SHOW);
-            ShowWindow(existing, SW_RESTORE);
-            SetForegroundWindow(existing);
+            ShowMainWindow(existing);
         }
-        CloseHandle(mutex);
         return 0;
     }
 
@@ -849,7 +893,15 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR commandLine, int)
 
     LoadSettings(g_state);
 
-    g_backgroundBrush = CreateSolidBrush(RGB(255, 255, 255));
+    // Opt the process into dark menus and scrollbars. uxtheme ordinal 135 (SetPreferredAppMode,
+    // 1 = AllowDark) is undocumented but unchanged since Windows 10 1903; without it the app still works.
+    if (const HMODULE uxtheme = LoadLibraryExW(L"uxtheme.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32))
+    {
+        if (const FARPROC setPreferredAppMode = GetProcAddress(uxtheme, MAKEINTRESOURCEA(135)))
+        {
+            reinterpret_cast<int(WINAPI *)(int)>(setPreferredAppMode)(1);
+        }
+    }
 
     WNDCLASSEXW windowClass{};
     windowClass.cbSize = sizeof(windowClass);
@@ -859,31 +911,26 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR commandLine, int)
     windowClass.hIconSm = static_cast<HICON>(LoadImageW(hInstance, MAKEINTRESOURCEW(IDI_APPICON), IMAGE_ICON,
                                                         GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), 0));
     windowClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    windowClass.hbrBackground = g_backgroundBrush;
     windowClass.lpszClassName = kWindowClass;
     RegisterClassExW(&windowClass);
 
     g_mainWindow = CreateWindowExW(0, kWindowClass, kWindowTitle,
                                    WS_OVERLAPPEDWINDOW,
-                                   CW_USEDEFAULT, CW_USEDEFAULT, 440, 520,
+                                   CW_USEDEFAULT, CW_USEDEFAULT, S(440), S(540),
                                    nullptr, nullptr, hInstance, nullptr);
     if (g_mainWindow == nullptr)
     {
-        if (mutex != nullptr)
-        {
-            CloseHandle(mutex);
-        }
         return 1;
     }
 
-    ShowWindow(g_mainWindow, startMinimized ? SW_HIDE : SW_SHOW);
     if (!startMinimized)
     {
+        ShowWindow(g_mainWindow, SW_SHOW);
         UpdateWindow(g_mainWindow);
     }
 
     g_workerStopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    g_workerThread = std::thread(WorkerLoop);
+    std::thread worker(WorkerLoop);
 
     MSG msg{};
     while (GetMessageW(&msg, nullptr, 0, 0) > 0)
@@ -896,42 +943,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR commandLine, int)
         DispatchMessageW(&msg);
     }
 
-    g_workerRunning = false;
-    if (g_workerStopEvent != nullptr)
-    {
-        SetEvent(g_workerStopEvent);
-    }
-    if (g_workerThread.joinable())
-    {
-        g_workerThread.join();
-    }
-    if (g_workerStopEvent != nullptr)
-    {
-        CloseHandle(g_workerStopEvent);
-        g_workerStopEvent = nullptr;
-    }
-
-    {
-        std::lock_guard<std::mutex> lock(g_stateMutex);
-        SaveSettings(g_state);
-    }
-
-    if (g_uiFont != nullptr)
-    {
-        DeleteObject(g_uiFont);
-    }
-    if (g_titleFont != nullptr)
-    {
-        DeleteObject(g_titleFont);
-    }
-    if (g_backgroundBrush != nullptr)
-    {
-        DeleteObject(g_backgroundBrush);
-    }
-    if (mutex != nullptr)
-    {
-        CloseHandle(mutex);
-    }
-
+    // Settings are saved on every change, and the OS reclaims handles and GDI objects on exit.
+    SetEvent(g_workerStopEvent);
+    worker.join();
     return static_cast<int>(msg.wParam);
 }

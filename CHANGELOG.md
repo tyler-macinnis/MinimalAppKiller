@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2026-11-17
+
+### Added
+
+- Dark mode: the app follows the Windows light/dark setting and switches live.
+- Windows 11 styling, with a title bar that matches the window.
+- High-DPI scaling, so the window is correctly sized on scaled displays.
+- A hint in the app list when it is empty.
+
+### Changed
+
+- Roomier layout with taller list rows.
+- Trimmed README and added a VS Code build task.
+
+### Fixed
+
+- Settings failing to save for Windows usernames with non-ASCII characters.
+
 ## [1.0.0] - 2026-06-12
 
 ### Added

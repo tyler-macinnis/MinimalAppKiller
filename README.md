@@ -17,8 +17,8 @@ A tiny native Windows tray app. One executable, no dependencies.
 
 Grab one of these from [Releases](https://github.com/tyler-macinnis/MinimalAppKiller/releases/latest):
 
-- **`Setup.exe`** installs it, with an optional desktop icon and run on startup.
-- **`portable.exe`** runs as is, no install.
+- **`MinimalAppKiller-x.y.z-setup.exe`** installs it, with an optional desktop icon and run on startup.
+- **`MinimalAppKiller.exe`** is portable and runs as is, no install.
 
 ## Use
 
@@ -48,7 +48,7 @@ msbuild MinimalAppKiller.sln /p:Configuration=Release /p:Platform=x64
 
 In VS Code, press `Ctrl+Shift+B`. The result is `x64\Release\MinimalAppKiller.exe`.
 
-To release, bump `MinimalAppKiller/version.h`, add a `CHANGELOG.md` entry, and push a `v1.2.3` tag. GitHub Actions builds and publishes the installer and portable exe.
+To release, bump `MinimalAppKiller/version.h`, add a `CHANGELOG.md` entry, and push a `v1.2.3` tag. GitHub Actions builds and publishes both files.
 
 ## License
 
